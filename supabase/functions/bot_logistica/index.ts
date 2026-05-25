@@ -1,0 +1,605 @@
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import * as fflate from "npm:fflate";
+import ExcelJS from "npm:exceljs";
+import { Buffer } from "node:buffer";
+
+const WHATSAPP_TOKEN = Deno.env.get("WHATSAPP_TOKEN") || "";
+const PHONE_NUMBER_ID = Deno.env.get("PHONE_NUMBER_ID") || "";
+const VERIFY_TOKEN = Deno.env.get("WHATSAPP_VERIFY_TOKEN") || "logistica_bot_verify_token";
+
+const AZURE_CONFIG = {
+  tenantId: Deno.env.get("AZURE_TENANT_ID") || "",
+  clientId: Deno.env.get("AZURE_CLIENT_ID") || "",
+  clientSecret: Deno.env.get("AZURE_CLIENT_SECRET") || "",
+  siteId: "firplaksa.sharepoint.com,44aa90e1-725c-4fb9-958b-ce5a483fc3de,50f65013-a82a-4738-bbf6-d41141c25ce4",
+  driveId: "b!4ZCqRFxyuU-Vi85aSD_D3hNQ9lAqqDhHu_bUEUHCXOSZHOppeuNNQqiYFUlWE7cM",
+  folderPath: "/1. Programación de Despachos",
+  sheetName: "Programador Despachos"
+};
+
+import https from "node:https";
+import nodeFetch from "npm:node-fetch";
+
+const SAP_CONFIG = {
+  baseUrl: Deno.env.get("SAP_BASE_URL") || "https://200.7.96.194:50000/b1s/v1",
+  companyDb: Deno.env.get("SAP_COMPANY_DB") || "Firplak_SA",
+  userName: Deno.env.get("SAP_USERNAME") || "manager",
+  password: Deno.env.get("SAP_PASSWORD") || ""
+};
+
+// Use node-fetch with an https.Agent that ignores unauthorized certificates
+// This bypasses Deno's strict Rust TLS validation (e.g., CaUsedAsEndEntity errors)
+const httpsAgent = new https.Agent({
+  rejectUnauthorized: false,
+});
+
+async function fetchSAP(url: string, options: any = {}) {
+  options.agent = httpsAgent;
+  return nodeFetch(url, options);
+}
+
+const DEPT_MAP: Record<string, string> = {
+  "5": "ANTIOQUIA", "8": "ATLANTICO", "11": "BOGOTA D.C.", "13": "BOLIVAR", "15": "BOYACA",
+  "17": "CALDAS", "18": "CAQUETA", "19": "CAUCA", "20": "CESAR", "23": "CORDOBA",
+  "25": "CUNDINAMARCA", "27": "CHOCO", "41": "HUILA", "44": "LA GUAJIRA", "47": "MAGDALENA",
+  "50": "META", "52": "NARIÑO", "54": "NORTE DE SANTANDER", "63": "QUINDIO", "66": "RISARALDA",
+  "68": "SANTANDER", "70": "SUCRE", "73": "TOLIMA", "76": "VALLE DEL CAUCA"
+};
+
+const DEPTO_MAP: Record<string, string> = {
+  "5": "ANTIOQUIA", "8": "ATLÁNTICO", "11": "BOGOTÁ D.C.", "13": "BOLÍVAR",
+  "15": "BOYACÁ", "17": "CALDAS", "18": "CAQUETÁ", "19": "CAUCA",
+  "20": "CESAR", "23": "CÓRDOBA", "25": "CUNDINAMARCA", "27": "CHOCÓ",
+  "41": "HUILA", "44": "LA GUAJIRA", "47": "MAGDALENA", "50": "META",
+  "52": "NARIÑO", "54": "NORTE DE SANTANDER", "63": "QUINDÍO", "66": "RISARALDA",
+  "68": "SANTANDER", "70": "SUCRE", "73": "TOLIMA", "76": "VALLE DEL CAUCA",
+  "81": "ARAUCA", "85": "CASANARE", "86": "PUTUMAYO", "88": "SAN ANDRÉS",
+  "91": "AMAZONAS", "94": "GUAINÍA", "95": "GUAVIARE", "97": "VAUPÉS", "99": "VICHADA"
+};
+
+const CORS_HEADERS = {
+  "Content-Type": "application/json",
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, apikey, Content-Type",
+};
+
+Deno.serve(async (req: Request) => {
+  const { method } = req;
+
+  // --- OPTIONS (CORS preflight) ---
+  if (method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+
+  // --- GET ---
+  if (method === "GET") {
+    const url = new URL(req.url);
+
+    // GET ?action=agendamiento  → lightweight, NO SAP
+    if (url.searchParams.get("action") === "agendamiento") {
+      try {
+        const rows = await getAgendamientoExcelOnly();
+        return new Response(
+          JSON.stringify({
+            rows,
+            data: rows,
+            summary: {
+              total: rows.length,
+              yellow: rows.filter((r: any) => r.color === "🟡").length,
+              green: rows.filter((r: any) => r.color === "🟢").length,
+            },
+          }),
+          { status: 200, headers: CORS_HEADERS },
+        );
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ error: err instanceof Error ? err.message : "Error generando agendamiento" }),
+          { status: 500, headers: CORS_HEADERS },
+        );
+      }
+    }
+
+    // WhatsApp webhook verification
+    if (url.searchParams.get("hub.verify_token") === VERIFY_TOKEN) {
+      return new Response(url.searchParams.get("hub.challenge"), { status: 200 });
+    }
+
+    return new Response("Forbidden", { status: 403 });
+  }
+
+  // --- POST (WhatsApp webhook) ---
+  if (method === "POST") {
+    try {
+      const body = await req.json();
+      const message = body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+
+      if (message) {
+        const from = message.from;
+        const text = message.text?.body?.toLowerCase();
+
+        if (text.includes("confirmar")) {
+          const orden = text.split(" ").pop();
+          await sendWhatsAppMessage(from, `⚙️ Buscando la OV ${orden} en la hoja "Programador Despachos"...`);
+          try {
+            await updateExcelOrder(orden, "CONFIRMADO");
+            await sendWhatsAppMessage(from, `✅ ¡Hecho! La OV ${orden} ha sido actualizada en el Excel.`);
+          } catch (err: any) {
+            await sendWhatsAppMessage(from, "❌ Error al actualizar: " + err.message);
+          }
+        } else if (text.includes("resumen") || text.includes("colores")) {
+          try {
+            await sendWhatsAppMessage(from, "⏳ Generando resumen de colores (Amarillos y Verdes)...");
+            const report = await getOrdersByColor();
+            let msg = `📊 *Resumen de Despachos Hoy*\n\n`;
+            msg += `🟡 *Amarillos (${report.yellowCount} OVs):*\n${report.yellow || "Ninguno"}\n\n`;
+            msg += `🟢 *Verdes (${report.greenCount} OVs):*\n${report.green || "Ninguno"}`;
+            await sendWhatsAppMessage(from, msg);
+          } catch (err: any) {
+            await sendWhatsAppMessage(from, "❌ Error al generar resumen: " + err.message);
+          }
+        } else if (text.includes("sap") || text.includes("direccion") || text.includes("contacto")) {
+          const orden = text.split(" ").pop();
+          try {
+            await sendWhatsAppMessage(from, `⚙️ Consultando SAP para la OV ${orden}...`);
+            const addr = await getSAPOrderAddress(orden);
+            if (addr) {
+              const deptName = DEPT_MAP[addr.departamento] || addr.departamento;
+              let msg = `📍 *Datos de Despacho (SAP) OV ${orden}*\n\n`;
+              msg += `👤 *Cliente Final:* ${addr.clienteFinal || "No definido"}\n`;
+              msg += `🏠 *Dirección:* ${addr.direccion}\n`;
+              msg += `🏙️ *Ciudad:* ${addr.ciudad}\n`;
+              msg += `🗺️ *Departamento:* ${deptName}\n`;
+              msg += `📞 *Teléfono:* ${addr.telefono || "No definido (Campo 6 vacío)"}`;
+              await sendWhatsAppMessage(from, msg);
+            } else {
+              await sendWhatsAppMessage(from, `❌ No se encontró la OV ${orden} en SAP.`);
+            }
+          } catch (err: any) {
+            await sendWhatsAppMessage(from, "❌ Error SAP: " + err.message);
+          }
+        } else if (text.includes("agendamiento")) {
+          try {
+            await sendWhatsAppMessage(from, "⏳ Generando listado de agendamiento (OVs Verdes y Amarillas)...");
+            const rows = await getAgendamiento();
+            if (rows.length === 0) {
+              await sendWhatsAppMessage(from, "ℹ️ No se encontraron órdenes en verde o amarillo.");
+            } else {
+              let msg = `📋 *Listado de Agendamiento (${rows.length} OVs)*\n\n`;
+              for (const r of rows.slice(0, 10)) {
+                msg += `*OV ${r.ov}* ${r.color}\n`;
+                msg += `👤 ${r.nombreCliente}\n`;
+                msg += `📞 ${r.telefono}\n`;
+                msg += `📍 ${r.direccion}\n`;
+                msg += `📦 ${r.descCant}\n\n`;
+              }
+              if (rows.length > 10) msg += `_...y ${rows.length - 10} OVs más._`;
+              await sendWhatsAppMessage(from, msg);
+            }
+          } catch (err: any) {
+            await sendWhatsAppMessage(from, "❌ Error al generar agendamiento: " + err.message);
+          }
+        } else {
+          await sendWhatsAppMessage(from, "🤖 *Bot Logística Firplak*\n\n- *'resumen'*: Ver OVs en amarillo y verde.\n- *'agendamiento'*: Listado completo con cliente, dirección y artículos.\n- *'confirmar [OV]'*: Marcar orden en Excel.\n- *'sap [OV]'*: Ver dirección y contacto de SAP.");
+        }
+      }
+      return new Response("OK", { status: 200 });
+    } catch (_error) {
+      return new Response("Error", { status: 500 });
+    }
+  }
+  return new Response("Not Allowed", { status: 405 });
+});
+
+// ─── Helpers ───────────────────────────────────────────
+
+function getTargetFilePattern() {
+  const months = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO", "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"];
+  const parts = new Intl.DateTimeFormat('es-CO', { timeZone: 'America/Bogota', day: 'numeric', month: 'numeric', year: 'numeric' }).formatToParts(new Date());
+  const day = parts.find(p => p.type === 'day')?.value;
+  const monthIdx = parseInt(parts.find(p => p.type === 'month')?.value || "1") - 1;
+  const year = parts.find(p => p.type === 'year')?.value;
+  return `FIRPLAK VISOR OV ${months[monthIdx]} ${day} AÑO ${year}.xlsm`;
+}
+
+async function getGraphToken() {
+  const url = `https://login.microsoftonline.com/${AZURE_CONFIG.tenantId}/oauth2/v2.0/token`;
+  const body = new URLSearchParams({ client_id: AZURE_CONFIG.clientId, client_secret: AZURE_CONFIG.clientSecret, scope: "https://graph.microsoft.com/.default", grant_type: "client_credentials" });
+  const res = await fetch(url, { method: "POST", body });
+  const data = await res.json();
+  return data.access_token;
+}
+
+async function findTargetFile(headers: any) {
+  const pattern = getTargetFilePattern().toUpperCase().replace(/\s+/g, " ");
+
+  const hydrateFile = async (file: any) => {
+    if (file?.["@microsoft.graph.downloadUrl"]) return file;
+    if (!file?.id) throw new Error(`El archivo encontrado no tiene id ni downloadUrl`);
+    const itemRes = await fetch(`https://graph.microsoft.com/v1.0/drives/${AZURE_CONFIG.driveId}/items/${file.id}`, { headers });
+    const item = await itemRes.json();
+    if (!itemRes.ok) throw new Error(`No se pudo obtener detalle del archivo: ${JSON.stringify(item)}`);
+    if (!item["@microsoft.graph.downloadUrl"]) throw new Error(`El archivo encontrado no tiene downloadUrl: ${item.name || file.name}`);
+    return item;
+  };
+
+  const driveRes = await fetch(`https://graph.microsoft.com/v1.0/drives/${AZURE_CONFIG.driveId}/root:${encodeURIComponent(AZURE_CONFIG.folderPath)}:/children`, { headers });
+  if (driveRes.ok) {
+    const files = await driveRes.json();
+    const file = files.value?.find((f: any) => f.name.toUpperCase().replace(/\s+/g, " ").includes(pattern));
+    if (file) return await hydrateFile(file);
+  }
+
+  const searchText = getTargetFilePattern().replace(".xlsm", "");
+  const searchRes = await fetch(`https://graph.microsoft.com/v1.0/drives/${AZURE_CONFIG.driveId}/root/search(q='${encodeURIComponent(searchText)}')`, { headers });
+  const matches = await searchRes.json();
+  if (!searchRes.ok) throw new Error(`Error buscando archivo en SharePoint: ${JSON.stringify(matches)}`);
+  const file = matches.value?.find((f: any) => f.name.toUpperCase().replace(/\s+/g, " ").includes(pattern));
+  if (!file) {
+    const names = matches.value?.map((f: any) => f.name).slice(0, 10).join(", ");
+    throw new Error(`No se encontró el archivo de hoy para "${pattern}". Coincidencias: ${names || "ninguna"}`);
+  }
+  return await hydrateFile(file);
+}
+
+// Color detection helpers
+const isYellow = (argb: string | undefined) => {
+  if (!argb || argb.length < 8) return false;
+  const r = parseInt(argb.substring(2, 4), 16);
+  const g = parseInt(argb.substring(4, 6), 16);
+  const b = parseInt(argb.substring(6, 8), 16);
+  return (argb === 'FFFFFF00' || argb === 'FFFFFF99' || argb === 'FFFFFFCC' || argb === 'FFFFC000') || (r > 200 && g > 180 && b < 150);
+};
+
+const isGreen = (argb: string | undefined) => {
+  if (!argb || argb.length < 8) return false;
+  const r = parseInt(argb.substring(2, 4), 16);
+  const g = parseInt(argb.substring(4, 6), 16);
+  const b = parseInt(argb.substring(6, 8), 16);
+  return (argb === 'FF92D050' || argb === 'FF00B050' || argb === 'FFC6EFCE' || argb === 'FF00FF00') || (g > 160 && r < 210 && b < 210 && g > r && g > b);
+};
+
+// ─── OPTIMIZED XML PARSER ──────────────────────────────
+
+async function extractOVsOptimized(arrayBuffer: ArrayBuffer) {
+  const zip = fflate.unzipSync(new Uint8Array(arrayBuffer));
+
+  // 1. Get the sheet ID for "Programador Despachos"
+  const workbookXml = new TextDecoder().decode(zip["xl/workbook.xml"]);
+  const sheetMatch = workbookXml.match(/<sheet[^>]+name="Programador Despachos"[^>]+sheetId="([^"]+)"[^>]*\/?>(?:<\/sheet>)?/i) || 
+                     workbookXml.match(/<sheet[^>]+sheetId="([^"]+)"[^>]+name="Programador Despachos"[^>]*\/?>(?:<\/sheet>)?/i);
+  if (!sheetMatch) throw new Error("Sheet not found");
+
+  const relsXml = new TextDecoder().decode(zip["xl/_rels/workbook.xml.rels"]);
+  const rIdMatch = workbookXml.match(new RegExp(`<sheet[^>]+name="Programador Despachos"[^>]+r:id="([^"]+)"`, "i")) || 
+                   workbookXml.match(new RegExp(`<sheet[^>]+r:id="([^"]+)"[^>]+name="Programador Despachos"`, "i"));
+  let targetFile = "xl/worksheets/sheet1.xml";
+  if (rIdMatch) {
+    const relMatch = relsXml.match(new RegExp(`<Relationship[^>]+Id="${rIdMatch[1]}"[^>]+Target="([^"]+)"`, "i"));
+    if (relMatch) targetFile = `xl/${relMatch[1]}`;
+  }
+
+  // 2. Parse Shared Strings
+  const sharedStringsXml = zip["xl/sharedStrings.xml"] ? new TextDecoder().decode(zip["xl/sharedStrings.xml"]) : "";
+  const sharedStrings: string[] = [];
+  const ssRegex = /<t[^>]*>([^<]*)<\/t>/g;
+  let match;
+  while ((match = ssRegex.exec(sharedStringsXml)) !== null) {
+      sharedStrings.push(match[1]);
+  }
+
+  // 3. Parse Styles
+  const stylesXml = zip["xl/styles.xml"] ? new TextDecoder().decode(zip["xl/styles.xml"]) : "";
+  const fills: (string|null)[] = [];
+  const fillsBlock = stylesXml.match(/<fills.*?>([\s\S]*?)<\/fills>/);
+  if (fillsBlock) {
+      const fillRegex = /<fill>([\s\S]*?)<\/fill>/g;
+      let fMatch;
+      while ((fMatch = fillRegex.exec(fillsBlock[1])) !== null) {
+          const fgColorMatch = fMatch[1].match(/<fgColor[^>]+rgb="([^"]+)"/);
+          fills.push(fgColorMatch ? fgColorMatch[1] : null);
+      }
+  }
+  const cellXfs: number[] = [];
+  const cellXfsBlock = stylesXml.match(/<cellXfs.*?>([\s\S]*?)<\/cellXfs>/);
+  if (cellXfsBlock) {
+      const xfRegex = /<xf([\s\S]*?)\/?>/g;
+      let xMatch;
+      while ((xMatch = xfRegex.exec(cellXfsBlock[1])) !== null) {
+          const fillIdMatch = xMatch[1].match(/fillId="([^"]+)"/);
+          cellXfs.push(fillIdMatch ? parseInt(fillIdMatch[1]) : 0);
+      }
+  }
+
+  // 4. Parse Sheet
+  const sheetXml = new TextDecoder().decode(zip[targetFile]);
+  const rows: any[] = [];
+  
+  const rowBlocks = sheetXml.split('<row ');
+  for (let i = 1; i < rowBlocks.length; i++) {
+     const block = rowBlocks[i];
+     const rMatch = block.match(/^r="(\d+)"/);
+     if (!rMatch) continue;
+     const rIdx = parseInt(rMatch[1]);
+     if (rIdx === 1) continue;
+     
+     const cBlocks = block.split('<c ');
+     const rowData: any = { argb: null, ov: null, item: null, desc: null, cant: null, totalNeto: 0 };
+     for (let j = 1; j < cBlocks.length; j++) {
+         const cBlock = cBlocks[j];
+         const colMatch = cBlock.match(/^r="([A-Z]+)\d+"/);
+         if (!colMatch) continue;
+         const col = colMatch[1];
+         const styleIdMatch = cBlock.match(/s="(\d+)"/);
+         const styleId = styleIdMatch ? parseInt(styleIdMatch[1]) : 0;
+         const typeMatch = cBlock.match(/t="([^"]+)"/);
+         const type = typeMatch ? typeMatch[1] : null;
+         
+         let val = null;
+         const vMatch = cBlock.match(/<v>([\s\S]*?)<\/v>/);
+         if (vMatch) {
+             val = type === "s" ? sharedStrings[parseInt(vMatch[1])] : vMatch[1];
+         }
+         
+         if (col === "A") {
+              const fillId = cellXfs[styleId];
+              if (fillId !== undefined && fills[fillId]) rowData.argb = fills[fillId];
+              rowData.ov = val;
+          } else if (col === "B") {
+              rowData.item = val;
+          } else if (col === "H") {
+              rowData.desc = val;
+          } else if (col === "I") {
+              rowData.cant = val;
+          } else if (col === "O") {
+              rowData.totalNeto = parseFloat(val || "0") || 0;
+          }
+     }
+     
+     if (rowData.ov && rowData.argb) {
+         if (rowData.argb.match(/FF[A-Z0-9]{6}/i)) {
+             if (isYellow(rowData.argb)) rowData.color = "🟡";
+             else if (isGreen(rowData.argb)) rowData.color = "🟢";
+             if (rowData.color && rowData.totalNeto !== 0) {
+                 rows.push(rowData);
+             }
+         }
+     }
+  }
+  
+  // Group by OV
+  const ovData: Record<string, { items: string[], desc: string[], cant: string[], color: string }> = {};
+  for (const r of rows) {
+      const ov = String(r.ov).trim();
+      if (!ovData[ov]) ovData[ov] = { items: [], desc: [], cant: [], color: r.color };
+      ovData[ov].items.push(String(r.item || ''));
+      ovData[ov].desc.push(String(r.desc || '').trim());
+      ovData[ov].cant.push(String(r.cant || ''));
+  }
+  return ovData;
+}
+
+// ─── LIGHTWEIGHT: Excel + SAP Batch agendamiento ────
+
+async function getAgendamientoExcelOnly() {
+  const token = await getGraphToken();
+  const headers = { "Authorization": `Bearer ${token}` };
+  const file = await findTargetFile(headers);
+  const fileRes = await fetch(file["@microsoft.graph.downloadUrl"]);
+  const arrayBuffer = await fileRes.arrayBuffer();
+
+  const ovData = await extractOVsOptimized(arrayBuffer);
+  const ovs = Object.keys(ovData);
+
+  // --- SAP BATCH QUERY ---
+  let sapDataMap: Record<string, any> = {};
+  let sapErrorStr = "";
+  if (ovs.length > 0) {
+    try {
+      const loginRes = await fetchSAP(`${SAP_CONFIG.baseUrl}/Login`, {
+        method: "POST",
+        body: JSON.stringify({ CompanyDB: SAP_CONFIG.companyDb, Password: SAP_CONFIG.password, UserName: SAP_CONFIG.userName })
+      });
+      const cookie = loginRes.headers.get("set-cookie") || "";
+
+      // Chunk OVs into groups of 20
+      const chunkSize = 20;
+      for (let i = 0; i < ovs.length; i += chunkSize) {
+        const chunk = ovs.slice(i, i + chunkSize);
+        const filterStr = chunk.map(ov => `DocNum eq ${ov}`).join(" or ");
+        // Explicitly URL encode the filter string to be safe
+        const res = await fetchSAP(`${SAP_CONFIG.baseUrl}/Orders?$filter=${encodeURIComponent(filterStr)}&$select=DocNum,CardCode,CardName,AddressExtension`, {
+          headers: { "Cookie": cookie }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          for (const order of (data.value || [])) {
+            sapDataMap[String(order.DocNum)] = order;
+          }
+        } else {
+          sapErrorStr = `Status ${res.status}: ${await res.text()}`;
+        }
+      }
+    } catch (e) {
+      console.error("Error batching SAP:", e);
+      sapErrorStr = String(e);
+    }
+  }
+
+  const results = [];
+  for (const ov of ovs) {
+    const combined = ovData[ov].desc.map((d, i) => `${ovData[ov].cant[i]} ${d}`);
+    const order = sapDataMap[ov];
+    let nombreCliente = "N/A", clienteFinal = "N/A", telefono = "N/A", direccion = "N/A";
+
+    if (order) {
+      const addr = order.AddressExtension;
+      const cCode = order.CardCode ? `${order.CardCode} - ` : "";
+      nombreCliente = `${cCode}${order.CardName || "N/A"}`;
+      clienteFinal = addr?.ShipToAddress2 || "N/A";
+      telefono = addr?.ShipToCounty || "N/A";
+      const calle = addr?.ShipToStreet || "";
+      const ciudad = addr?.ShipToCity || "";
+      const deptoCode = String(addr?.ShipToState || "").trim();
+      const depto = DEPTO_MAP[deptoCode] || deptoCode;
+      direccion = [calle, ciudad, depto].filter(p => p).join(", ") || "N/A";
+    } else {
+      nombreCliente = `Pendiente SAP ${sapErrorStr ? `(Error: ${sapErrorStr})` : "(No encontrado)"}`;
+    }
+
+    results.push({
+      ov,
+      color: ovData[ov].color,
+      nombreCliente,
+      clienteFinal,
+      telefono,
+      direccion,
+      descCant: combined.join(", "),
+    });
+  }
+  return results;
+}
+
+// ─── HEAVY: Full agendamiento with SAP (WhatsApp only) ─
+
+async function getAgendamiento() {
+  const token = await getGraphToken();
+  const headers = { "Authorization": `Bearer ${token}` };
+  const file = await findTargetFile(headers);
+  const fileRes = await fetch(file["@microsoft.graph.downloadUrl"]);
+  const arrayBuffer = await fileRes.arrayBuffer();
+  
+  const ovData = await extractOVsOptimized(arrayBuffer);
+
+  const loginRes = await fetchSAP(`${SAP_CONFIG.baseUrl}/Login`, {
+    method: "POST",
+    body: JSON.stringify({ CompanyDB: SAP_CONFIG.companyDb, Password: SAP_CONFIG.password, UserName: SAP_CONFIG.userName })
+  });
+  const cookie = loginRes.headers.get("set-cookie") || "";
+
+  const results = [];
+  for (const ov of Object.keys(ovData)) {
+    const res = await fetchSAP(`${SAP_CONFIG.baseUrl}/Orders?$filter=DocNum eq ${ov}&$select=DocNum,CardCode,CardName,AddressExtension`, {
+      headers: { "Cookie": cookie }
+    });
+    let nombreCliente = "N/A", clienteFinal = "N/A", telefono = "N/A", direccion = "N/A";
+    if (res.ok) {
+      const data = await res.json();
+      const order = data.value?.[0];
+      const addr = order?.AddressExtension;
+      const cCode = order?.CardCode ? `${order.CardCode} - ` : "";
+      nombreCliente = `${cCode}${order?.CardName || "N/A"}`;
+      clienteFinal = addr?.ShipToAddress2 || "N/A";
+      telefono = addr?.ShipToCounty || "N/A";
+      const calle = addr?.ShipToStreet || "";
+      const ciudad = addr?.ShipToCity || "";
+      const deptoCode = String(addr?.ShipToState || "").trim();
+      const depto = DEPTO_MAP[deptoCode] || deptoCode;
+      direccion = [calle, ciudad, depto].filter(p => p).join(", ") || "N/A";
+    }
+    const combined = ovData[ov].desc.map((d, i) => `${ovData[ov].cant[i]} ${d}`);
+    results.push({
+      ov,
+      color: ovData[ov].color,
+      nombreCliente,
+      clienteFinal,
+      telefono,
+      direccion,
+      descCant: combined.join(", ")
+    });
+  }
+  return results;
+}
+
+// ─── Other existing functions ──────────────────────────
+
+async function getOrdersByColor() {
+  const token = await getGraphToken();
+  const headers = { "Authorization": `Bearer ${token}` };
+  const file = await findTargetFile(headers);
+  const fileRes = await fetch(file["@microsoft.graph.downloadUrl"]);
+  const arrayBuffer = await fileRes.arrayBuffer();
+  
+  const ovData = await extractOVsOptimized(arrayBuffer);
+
+  const yellowCounts: Record<string, string[]> = {};
+  const greenCounts: Record<string, string[]> = {};
+
+  for (const ov of Object.keys(ovData)) {
+      if (ovData[ov].color === '🟡') {
+          yellowCounts[ov] = ovData[ov].items;
+      } else if (ovData[ov].color === '🟢') {
+          greenCounts[ov] = ovData[ov].items;
+      }
+  }
+
+  const formatList = (counts: Record<string, string[]>) => {
+    return Object.keys(counts).map(ov => `${ov} (${counts[ov].length} ítems)`).join(", ");
+  };
+
+  return {
+    yellow: formatList(yellowCounts),
+    green: formatList(greenCounts),
+    yellowCount: Object.keys(yellowCounts).length,
+    greenCount: Object.keys(greenCounts).length
+  };
+}
+
+async function getSAPOrderAddress(docNum: string) {
+  const loginRes = await fetchSAP(`${SAP_CONFIG.baseUrl}/Login`, {
+    method: "POST",
+    body: JSON.stringify({ CompanyDB: SAP_CONFIG.companyDb, Password: SAP_CONFIG.password, UserName: SAP_CONFIG.userName })
+  });
+  const cookie = loginRes.headers.get("set-cookie");
+  const queryUrl = `${SAP_CONFIG.baseUrl}/Orders?$filter=DocNum eq ${docNum}&$select=AddressExtension`;
+  const res = await fetchSAP(queryUrl, { headers: { "Cookie": cookie || "" } });
+  const data = await res.json();
+  const addr = data.value?.[0]?.AddressExtension;
+  if (addr) {
+    return {
+      clienteFinal: addr.ShipToAddress2,
+      direccion: addr.ShipToStreet,
+      ciudad: addr.ShipToCity,
+      departamento: addr.ShipToState,
+      telefono: addr.ShipToCounty
+    };
+  }
+  return null;
+}
+
+async function updateExcelOrder(orderId: string, newStatus: string) {
+  const token = await getGraphToken();
+  const headers = { "Authorization": `Bearer ${token}` };
+  const file = await findTargetFile(headers);
+  const fileRes = await fetch(file["@microsoft.graph.downloadUrl"]);
+  const arrayBuffer = await fileRes.arrayBuffer();
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(Buffer.from(arrayBuffer));
+  const sheet = workbook.getWorksheet(AZURE_CONFIG.sheetName);
+  let statusCol = 0;
+  sheet.getRow(1).eachCell((cell: any, colNumber: number) => {
+    if (cell.value === 'Estado_Bot') statusCol = colNumber;
+  });
+  if (statusCol === 0) statusCol = sheet.columnCount + 1;
+  sheet.getRow(1).getCell(statusCol).value = 'Estado_Bot';
+  sheet.eachRow((row: any, rowNumber: number) => {
+    if (rowNumber === 1) return;
+    if (String(row.getCell(1).value || "") === orderId) {
+      row.getCell(statusCol).value = newStatus;
+    }
+  });
+  const outBuffer = await workbook.xlsx.writeBuffer();
+  await fetch(`https://graph.microsoft.com/v1.0/drives/${AZURE_CONFIG.driveId}/items/${file.id}/content`, {
+    method: "PUT",
+    headers: { ...headers, "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
+    body: outBuffer
+  });
+}
+
+async function sendWhatsAppMessage(to: string, text: string) {
+  await fetch(`https://graph.facebook.com/v17.0/${PHONE_NUMBER_ID}/messages`, {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ messaging_product: "whatsapp", to, type: "text", text: { body: text } })
+  });
+}

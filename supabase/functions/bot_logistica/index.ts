@@ -1,24 +1,27 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "npm:@supabase/supabase-js";
 import * as fflate from "npm:fflate";
 import ExcelJS from "npm:exceljs";
 import { Buffer } from "node:buffer";
 
 const WHATSAPP_TOKEN = Deno.env.get("WHATSAPP_TOKEN") || "";
 const PHONE_NUMBER_ID = Deno.env.get("PHONE_NUMBER_ID") || "";
-const VERIFY_TOKEN = Deno.env.get("WHATSAPP_VERIFY_TOKEN") || "logistica_bot_verify_token";
+const VERIFY_TOKEN = "Firplak_Logistica_WH_8a9B2c!_2026";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL") || "",
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || ""
+);
 
 const AZURE_CONFIG = {
   tenantId: Deno.env.get("AZURE_TENANT_ID") || "",
   clientId: Deno.env.get("AZURE_CLIENT_ID") || "",
   clientSecret: Deno.env.get("AZURE_CLIENT_SECRET") || "",
-  siteId: "firplaksa.sharepoint.com,44aa90e1-725c-4fb9-958b-ce5a483fc3de,50f65013-a82a-4738-bbf6-d41141c25ce4",
-  driveId: "b!4ZCqRFxyuU-Vi85aSD_D3hNQ9lAqqDhHu_bUEUHCXOSZHOppeuNNQqiYFUlWE7cM",
+  siteId: Deno.env.get("AZURE_SITE_ID") || "",
+  driveId: Deno.env.get("AZURE_DRIVE_ID") || "",
   folderPath: "/1. Programación de Despachos",
   sheetName: "Programador Despachos"
 };
-
-import https from "node:https";
-import nodeFetch from "npm:node-fetch";
 
 const SAP_CONFIG = {
   baseUrl: Deno.env.get("SAP_BASE_URL") || "https://200.7.96.194:50000/b1s/v1",
@@ -27,15 +30,13 @@ const SAP_CONFIG = {
   password: Deno.env.get("SAP_PASSWORD") || ""
 };
 
-// Use node-fetch with an https.Agent that ignores unauthorized certificates
-// This bypasses Deno's strict Rust TLS validation (e.g., CaUsedAsEndEntity errors)
-const httpsAgent = new https.Agent({
-  rejectUnauthorized: false,
+const httpClient = Deno.createHttpClient({
+  tls: { rejectUnauthorized: false }
 });
 
 async function fetchSAP(url: string, options: any = {}) {
-  options.agent = httpsAgent;
-  return nodeFetch(url, options);
+  options.client = httpClient;
+  return fetch(url, options);
 }
 
 const DEPT_MAP: Record<string, string> = {
@@ -79,7 +80,8 @@ Deno.serve(async (req: Request) => {
     // GET ?action=agendamiento  → lightweight, NO SAP
     if (url.searchParams.get("action") === "agendamiento") {
       try {
-        const rows = await getAgendamientoExcelOnly();
+        const dateStr = url.searchParams.get("date") || undefined;
+        const rows = await getAgendamientoExcelOnly(dateStr);
         return new Response(
           JSON.stringify({
             rows,
@@ -100,6 +102,38 @@ Deno.serve(async (req: Request) => {
       }
     }
 
+    // GET ?action=fechas_disponibles
+    if (url.searchParams.get("action") === "fechas_disponibles") {
+      try {
+        const token = await getGraphToken();
+        const headers = { "Authorization": `Bearer ${token}` };
+        const driveRes = await fetch(`https://graph.microsoft.com/v1.0/drives/${AZURE_CONFIG.driveId}/root:${encodeURIComponent(AZURE_CONFIG.folderPath)}:/children`, { headers });
+        if (!driveRes.ok) throw new Error("No se pudo listar los archivos de SharePoint.");
+        const files = await driveRes.json();
+        
+        const datesFound = new Set<string>();
+        const monthsMap: Record<string, string> = { "ENERO": "01", "FEBRERO": "02", "MARZO": "03", "ABRIL": "04", "MAYO": "05", "JUNIO": "06", "JULIO": "07", "AGOSTO": "08", "SEPTIEMBRE": "09", "OCTUBRE": "10", "NOVIEMBRE": "11", "DICIEMBRE": "12" };
+        const regex = /^FIRPLAK VISOR OV ([A-Z]+) (\d+) AÑO (\d+)\.xlsm$/i;
+        
+        for (const file of files.value || []) {
+          const match = file.name.toUpperCase().replace(/\s+/g, " ").match(regex);
+          if (match) {
+            const [, mesName, dia, anio] = match;
+            const mes = monthsMap[mesName];
+            if (mes) {
+              const diaPad = dia.padStart(2, "0");
+              datesFound.add(`${anio}-${mes}-${diaPad}`);
+            }
+          }
+        }
+        
+        const sortedDates = Array.from(datesFound).sort((a, b) => b.localeCompare(a));
+        return new Response(JSON.stringify({ dates: sortedDates }), { status: 200, headers: CORS_HEADERS });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err instanceof Error ? err.message : "Error" }), { status: 500, headers: CORS_HEADERS });
+      }
+    }
+
     // WhatsApp webhook verification
     if (url.searchParams.get("hub.verify_token") === VERIFY_TOKEN) {
       return new Response(url.searchParams.get("hub.challenge"), { status: 200 });
@@ -117,6 +151,19 @@ Deno.serve(async (req: Request) => {
       if (message) {
         const from = message.from;
         const text = message.text?.body?.toLowerCase();
+
+        // Guardar mensaje entrante en la BD
+        if (text && from) {
+          const { error: dbError } = await supabase.from("whatsapp_messages").insert([
+            {
+              phone_number: from,
+              direction: "inbound",
+              message_body: text,
+              status: "received",
+            },
+          ]);
+          if (dbError) console.error("Error guardando inbound message:", dbError);
+        }
 
         if (text.includes("confirmar")) {
           const orden = text.split(" ").pop();
@@ -179,9 +226,10 @@ Deno.serve(async (req: Request) => {
           } catch (err: any) {
             await sendWhatsAppMessage(from, "❌ Error al generar agendamiento: " + err.message);
           }
-        } else {
-          await sendWhatsAppMessage(from, "🤖 *Bot Logística Firplak*\n\n- *'resumen'*: Ver OVs en amarillo y verde.\n- *'agendamiento'*: Listado completo con cliente, dirección y artículos.\n- *'confirmar [OV]'*: Marcar orden en Excel.\n- *'sap [OV]'*: Ver dirección y contacto de SAP.");
         }
+        // else {
+        //   await sendWhatsAppMessage(from, "🤖 *Bot Logística Firplak*\\n\\n- *'resumen'*: Ver OVs en amarillo y verde.\\n- *'agendamiento'*: Listado completo con cliente, dirección y artículos.\\n- *'confirmar [OV]'*: Marcar orden en Excel.\\n- *'sap [OV]'*: Ver dirección y contacto de SAP.");
+        // }
       }
       return new Response("OK", { status: 200 });
     } catch (_error) {
@@ -193,9 +241,10 @@ Deno.serve(async (req: Request) => {
 
 // ─── Helpers ───────────────────────────────────────────
 
-function getTargetFilePattern() {
+function getTargetFilePattern(dateStr?: string) {
   const months = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO", "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"];
-  const parts = new Intl.DateTimeFormat('es-CO', { timeZone: 'America/Bogota', day: 'numeric', month: 'numeric', year: 'numeric' }).formatToParts(new Date());
+  const d = dateStr ? new Date(`${dateStr}T12:00:00`) : new Date();
+  const parts = new Intl.DateTimeFormat('es-CO', { timeZone: 'America/Bogota', day: 'numeric', month: 'numeric', year: 'numeric' }).formatToParts(d);
   const day = parts.find(p => p.type === 'day')?.value;
   const monthIdx = parseInt(parts.find(p => p.type === 'month')?.value || "1") - 1;
   const year = parts.find(p => p.type === 'year')?.value;
@@ -210,8 +259,8 @@ async function getGraphToken() {
   return data.access_token;
 }
 
-async function findTargetFile(headers: any) {
-  const pattern = getTargetFilePattern().toUpperCase().replace(/\s+/g, " ");
+async function findTargetFile(headers: any, dateStr?: string) {
+  const pattern = getTargetFilePattern(dateStr).toUpperCase().replace(/\s+/g, " ");
 
   const hydrateFile = async (file: any) => {
     if (file?.["@microsoft.graph.downloadUrl"]) return file;
@@ -230,7 +279,7 @@ async function findTargetFile(headers: any) {
     if (file) return await hydrateFile(file);
   }
 
-  const searchText = getTargetFilePattern().replace(".xlsm", "");
+  const searchText = getTargetFilePattern(dateStr).replace(".xlsm", "");
   const searchRes = await fetch(`https://graph.microsoft.com/v1.0/drives/${AZURE_CONFIG.driveId}/root/search(q='${encodeURIComponent(searchText)}')`, { headers });
   const matches = await searchRes.json();
   if (!searchRes.ok) throw new Error(`Error buscando archivo en SharePoint: ${JSON.stringify(matches)}`);
@@ -381,10 +430,10 @@ async function extractOVsOptimized(arrayBuffer: ArrayBuffer) {
 
 // ─── LIGHTWEIGHT: Excel + SAP Batch agendamiento ────
 
-async function getAgendamientoExcelOnly() {
+async function getAgendamientoExcelOnly(dateStr?: string) {
   const token = await getGraphToken();
   const headers = { "Authorization": `Bearer ${token}` };
-  const file = await findTargetFile(headers);
+  const file = await findTargetFile(headers, dateStr);
   const fileRes = await fetch(file["@microsoft.graph.downloadUrl"]);
   const arrayBuffer = await fileRes.arrayBuffer();
 
@@ -597,9 +646,28 @@ async function updateExcelOrder(orderId: string, newStatus: string) {
 }
 
 async function sendWhatsAppMessage(to: string, text: string) {
-  await fetch(`https://graph.facebook.com/v17.0/${PHONE_NUMBER_ID}/messages`, {
+  let cleanNumber = to.replace(/\D/g, "");
+  if (cleanNumber.length === 10) {
+    cleanNumber = `57${cleanNumber}`;
+  }
+
+  const res = await fetch(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
     method: "POST",
     headers: { "Authorization": `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ messaging_product: "whatsapp", to, type: "text", text: { body: text } })
+    body: JSON.stringify({ messaging_product: "whatsapp", to: cleanNumber, type: "text", text: { body: text } })
   });
+
+  if (res.ok) {
+    await supabase.from("whatsapp_messages").insert([
+      {
+        phone_number: cleanNumber,
+        direction: "outbound",
+        message_body: text,
+        status: "sent",
+      },
+    ]);
+  } else {
+    const errorText = await res.text();
+    console.error("Error enviando mensaje de WP:", errorText);
+  }
 }

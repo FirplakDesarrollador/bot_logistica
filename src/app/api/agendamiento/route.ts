@@ -1,4 +1,47 @@
 import { NextResponse } from "next/server";
+import { supabase } from "@/lib/supabase";
+import * as https from "node:https";
+
+const httpsAgent = new https.Agent({
+  rejectUnauthorized: false
+});
+
+async function fetchSAPNode(url: string, options: any = {}) {
+  // We use node:https to bypass TLS errors since Next.js fetch ignores it
+  return new Promise<any>((resolve, reject) => {
+    options.headers = options.headers || {};
+    if (options.body) {
+      options.headers['Content-Length'] = Buffer.byteLength(options.body);
+      options.headers['Content-Type'] = 'application/json';
+    }
+    const req = https.request(url, {
+      method: options.method || "GET",
+      headers: options.headers || {},
+      agent: httpsAgent
+    }, (res) => {
+      let data = "";
+      res.on("data", chunk => data += chunk);
+      res.on("end", () => {
+        resolve({
+          ok: res.statusCode && res.statusCode >= 200 && res.statusCode < 300,
+          status: res.statusCode,
+          rawHeaders: res.headers, // Node.js http.IncomingMessage.headers has set-cookie as an array
+          headers: { 
+            get: (name: string) => {
+              const val = res.headers[name.toLowerCase()];
+              return Array.isArray(val) ? val[0] : (val || "");
+            } 
+          },
+          json: () => Promise.resolve(JSON.parse(data)),
+          text: () => Promise.resolve(data)
+        });
+      });
+    });
+    req.on("error", reject);
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+}
 
 const functionUrl = process.env.SUPABASE_BOT_LOGISTICA_FUNCTION_URL;
 const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
@@ -7,7 +50,7 @@ const SAP_CONFIG = {
   baseUrl: process.env.SAP_BASE_URL || "https://200.7.96.194:50000/b1s/v1",
   companyDb: process.env.SAP_COMPANY_DB || "Firplak_SA",
   userName: process.env.SAP_USERNAME || "manager",
-  password: process.env.SAP_PASSWORD || ""
+  password: process.env.SAP_PASSWORD || "2023Fir#.*"
 };
 
 const DEPTO_MAP: Record<string, string> = {
@@ -102,22 +145,39 @@ export async function GET() {
         // Bypass Node TLS strict certificate checks for SAP's malformed certificate
         process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
-        const loginRes = await fetch(`${SAP_CONFIG.baseUrl}/Login`, {
-          method: "POST",
-          body: JSON.stringify({
+        const loginBody = JSON.stringify({
             CompanyDB: SAP_CONFIG.companyDb,
-            Password: SAP_CONFIG.password,
+            Password: SAP_CONFIG.password || "2023Fir#.*",
             UserName: SAP_CONFIG.userName
-          }),
-          cache: "no-store",
+          });
+        console.log("DEBUG SAP LOGIN BODY:", loginBody);
+        console.log("DEBUG SAP_PASSWORD env:", JSON.stringify(process.env.SAP_PASSWORD));
+        const loginRes = await fetchSAPNode(`${SAP_CONFIG.baseUrl}/Login`, {
+          method: "POST",
+          body: loginBody
         });
+
+        if (!loginRes.ok) {
+           const errBody = await loginRes.text();
+           throw new Error(`Login failed with status ${loginRes.status}: ${errBody}`);
+        }
+
+        console.log("NEXT.JS SAP LOGIN STATUS:", loginRes.status);
+        const cookieHeaderVal = loginRes.rawHeaders ? loginRes.rawHeaders['set-cookie'] : "";
+        console.log("NEXT.JS SAP LOGIN COOKIE HEADER:", cookieHeaderVal);
 
         const cookieHeader = loginRes.headers.get("set-cookie") || "";
         let cookie = cookieHeader;
         if (typeof cookieHeader === 'string') {
           const match = cookieHeader.match(/B1SESSION=[^;]+/);
           if (match) cookie = match[0];
+        } else if (Array.isArray(cookieHeaderVal)) {
+           for (const c of cookieHeaderVal) {
+             const match = c.match(/B1SESSION=[^;]+/);
+             if (match) { cookie = match[0]; break; }
+           }
         }
+        console.log("NEXT.JS EXTRACTED COOKIE:", cookie);
 
         const ovs = pendingOrders.map((o) => o.ov);
         const chunkSize = 20;
@@ -126,10 +186,10 @@ export async function GET() {
         for (let i = 0; i < ovs.length; i += chunkSize) {
           const chunk = ovs.slice(i, i + chunkSize);
           const filterStr = chunk.map(ov => `DocNum eq ${ov}`).join(" or ");
-          const res = await fetch(`${SAP_CONFIG.baseUrl}/Orders?$filter=${encodeURIComponent(filterStr)}&$select=DocNum,CardCode,CardName,AddressExtension`, {
-            headers: { "Cookie": cookie },
-            cache: "no-store"
+          const res = await fetchSAPNode(`${SAP_CONFIG.baseUrl}/Orders?$filter=${encodeURIComponent(filterStr)}&$select=DocNum,CardCode,CardName,AddressExtension`, {
+            headers: { "Cookie": cookie }
           });
+          console.log("NEXT.JS SAP ORDERS STATUS:", res.status);
           
           if (res.ok) {
             const data = await res.json();
@@ -158,6 +218,11 @@ export async function GET() {
       }
     } catch (e) {
       console.error("Error on fallback SAP fetch in Next.js:", e);
+      for (const order of orders) {
+        if (order.nombreCliente?.includes("Pendiente SAP")) {
+          order.nombreCliente = `FALLBACK ERROR: ${String(e)}`;
+        }
+      }
     }
 
     return NextResponse.json({

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
+import { supabase } from "@/lib/supabase";
 
-// Hardcoded for testing purposes based on the Edge Function credentials
+// Read from environment variables
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN || "";
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || "";
 
@@ -46,6 +47,20 @@ export async function POST(request: Request) {
         { error: data.error?.message || "Error al enviar mensaje WP" },
         { status: response.status }
       );
+    }
+
+    // Guardar el mensaje en la base de datos
+    const { error: dbError } = await supabase.from("whatsapp_messages").insert([
+      {
+        phone_number: cleanNumber,
+        direction: "outbound",
+        message_body: text,
+        status: "sent",
+      },
+    ]);
+
+    if (dbError) {
+      console.error("Error guardando mensaje en BD:", dbError);
     }
 
     return NextResponse.json({ success: true, data });

@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import type { User } from "@supabase/supabase-js";
 import { supabase, supabaseRestUrl } from "@/lib/supabase";
 
@@ -147,6 +148,12 @@ export function DashboardShell() {
 
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
             <p className="break-all text-sm text-[#5f625c]">{user?.email}</p>
+            <Link
+              href="/dashboard/chats"
+              className="flex h-10 items-center justify-center border border-[#20231f] px-4 text-sm font-semibold transition hover:bg-[#20231f] hover:text-white"
+            >
+              Chats
+            </Link>
             <button
               type="button"
               onClick={handleLogout}

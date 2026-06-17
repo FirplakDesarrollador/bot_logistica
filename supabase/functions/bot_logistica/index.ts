@@ -165,6 +165,112 @@ Deno.serve(async (req: Request) => {
           if (dbError) console.error("Error guardando inbound message:", dbError);
         }
 
+        // --- Lógica del Agente IA ---
+        const { data: contact } = await supabase
+          .from("whatsapp_contacts")
+          .select("ai_enabled")
+          .eq("phone_number", from)
+          .single();
+
+        if (contact?.ai_enabled) {
+          const { data: recentMsgs } = await supabase
+            .from("whatsapp_messages")
+            .select("direction, message_body")
+            .eq("phone_number", from)
+            .order("created_at", { ascending: false })
+            .limit(10);
+
+          // Extract OVs from user messages to fetch real SAP info
+          const ovsToFetch = new Set<string>();
+          if (recentMsgs) {
+            for (const m of recentMsgs) {
+              if (m.direction === "inbound") {
+                const matches = m.message_body.match(/\b(1\d{5})\b/g);
+                if (matches) matches.forEach((match: string) => ovsToFetch.add(match));
+              }
+            }
+          }
+
+          let extraContext = "";
+          if (ovsToFetch.size > 0) {
+            try {
+               const loginRes = await fetchSAP(`${SAP_CONFIG.baseUrl}/Login`, { 
+                 method: "POST", 
+                 body: JSON.stringify({ CompanyDB: SAP_CONFIG.companyDb, Password: SAP_CONFIG.password, UserName: SAP_CONFIG.userName }) 
+               });
+               
+               // Extract cookie safely
+               let cookie = "";
+               const cookieHeader = loginRes.headers.get("set-cookie");
+               if (cookieHeader) {
+                 const match = cookieHeader.match(/B1SESSION=[^;]+/);
+                 if (match) cookie = match[0];
+               }
+               
+               for (const ov of ovsToFetch) {
+                 const res = await fetchSAP(`${SAP_CONFIG.baseUrl}/Orders?$filter=DocNum eq ${ov}&$select=DocNum,CardCode,CardName,AddressExtension,DocumentLines`, { headers: { "Cookie": cookie } });
+                 if (res.ok) {
+                   const data = await res.json();
+                   if (data.value && data.value.length > 0) {
+                     const order = data.value[0];
+                     const items = order.DocumentLines?.map((l: any) => `${l.Quantity} x ${l.ItemDescription}`).join(", ") || "";
+                     const cliente = order.CardName;
+                     const dir = order.AddressExtension?.ShipToStreet || "N/A";
+                     const city = order.AddressExtension?.ShipToCity || "N/A";
+                     
+                     extraContext += `\n- OV ${ov}: Cliente: ${cliente}. Dirección: ${dir}, ${city}. Artículos: ${items}.`;
+                   } else {
+                     extraContext += `\n- OV ${ov}: No se encontró en el sistema.`;
+                   }
+                 }
+               }
+            } catch (err) {
+               console.error("Error fetching SAP info for AI:", err);
+            }
+          }
+
+          const groqMessages = [
+            { role: "system", content: "Eres de servicio al cliente de logística en FIRPLAK S.A. Actúa como un humano, sé EXTREMADAMENTE breve y al grano. Saluda muy corto, por ejemplo: '¡Hola! ¿Cómo estás? ¿En qué te puedo ayudar hoy?'. NO des explicaciones largas. NO ofrezcas ayuda repetitiva. Si preguntan por una OV, da solo el estado, fecha y artículos sin adornos." + (extraContext ? `\n\nDatos de las OVs consultadas:\n${extraContext}` : "") }
+          ];
+
+          if (recentMsgs) {
+            const ordered = recentMsgs.reverse();
+            for (const m of ordered) {
+              groqMessages.push({
+                role: m.direction === "inbound" ? "user" : "assistant",
+                content: m.message_body
+              });
+            }
+          }
+
+          try {
+            const aiRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${Deno.env.get("GROQ_API_KEY")}`
+              },
+              body: JSON.stringify({
+                model: "llama-3.1-8b-instant",
+                messages: groqMessages,
+                max_tokens: 300
+              })
+            });
+
+            if (aiRes.ok) {
+              const aiData = await aiRes.json();
+              const reply = aiData.choices[0].message.content;
+              await sendWhatsAppMessage(from, reply);
+              return new Response("OK", { status: 200 }); // Termina aquí si la IA respondió
+            } else {
+              console.error("Groq error:", await aiRes.text());
+            }
+          } catch (err) {
+            console.error("AI fetch error:", err);
+          }
+        }
+        // --- Fin Lógica Agente IA ---
+
         if (text.includes("confirmar")) {
           const orden = text.split(" ").pop();
           await sendWhatsAppMessage(from, `⚙️ Buscando la OV ${orden} en la hoja "Programador Despachos"...`);

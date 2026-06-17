@@ -298,6 +298,7 @@ export function DashboardShell() {
             </div>
 
             <WhatsAppTestPanel />
+            <TemplateTestPanel />
             <ChatConversationsPanel />
           </aside>
         </div>
@@ -388,6 +389,161 @@ function WhatsAppTestPanel() {
   );
 }
 
+function TemplateTestPanel() {
+  const [formData, setFormData] = useState({
+    to: "",
+    nombre: "esteban",
+    proveedor: "home center",
+    producto: "lavamanos",
+    fechaEstimada: "10/06/2026",
+    diasEntrega: "15/06/2026 y 19/06/2026",
+    direccion: "CR 69 A 36 SUR 146"
+  });
+  const [isLoading, setIsLoading] = useState(false);
+  const [result, setResult] = useState<{ type: "success" | "error"; text: string } | null>(null);
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const { name, value } = e.target;
+    setFormData(prev => ({ ...prev, [name]: value }));
+  };
+
+  async function handleSend(e: React.FormEvent) {
+    e.preventDefault();
+    if (!formData.to) return;
+    setIsLoading(true);
+    setResult(null);
+
+    try {
+      const res = await fetch("/api/whatsapp/template", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(formData),
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || "Error al enviar");
+      }
+      setResult({ type: "success", text: "¡Plantilla enviada correctamente!" });
+    } catch (err: any) {
+      setResult({ type: "error", text: err.message });
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  return (
+    <div className="border border-[#d9d2c2] bg-white p-6 shadow-sm">
+      <p className="text-sm font-medium uppercase text-[#6c8f5e]">
+        Prueba Plantilla Despacho
+      </p>
+      <form onSubmit={handleSend} className="mt-4 flex flex-col gap-3">
+        <div>
+          <label className="text-xs font-semibold text-[#5f625c]">Número destino</label>
+          <input
+            type="text"
+            name="to"
+            placeholder="Ej: 3001234567"
+            className="mt-1 w-full border border-[#d9d2c2] p-2 text-sm focus:border-[#6c8f5e] focus:outline-none"
+            value={formData.to}
+            onChange={handleChange}
+            required
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <label className="text-xs font-semibold text-[#5f625c]">Nombre</label>
+            <input
+              type="text"
+              name="nombre"
+              className="mt-1 w-full border border-[#d9d2c2] p-2 text-sm focus:border-[#6c8f5e] focus:outline-none"
+              value={formData.nombre}
+              onChange={handleChange}
+              required
+            />
+          </div>
+          <div>
+            <label className="text-xs font-semibold text-[#5f625c]">Proveedor</label>
+            <input
+              type="text"
+              name="proveedor"
+              className="mt-1 w-full border border-[#d9d2c2] p-2 text-sm focus:border-[#6c8f5e] focus:outline-none"
+              value={formData.proveedor}
+              onChange={handleChange}
+              required
+            />
+          </div>
+        </div>
+        <div>
+          <label className="text-xs font-semibold text-[#5f625c]">Producto</label>
+          <input
+            type="text"
+            name="producto"
+            className="mt-1 w-full border border-[#d9d2c2] p-2 text-sm focus:border-[#6c8f5e] focus:outline-none"
+            value={formData.producto}
+            onChange={handleChange}
+            required
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <label className="text-xs font-semibold text-[#5f625c]">Día Estimado</label>
+            <input
+              type="text"
+              name="fechaEstimada"
+              className="mt-1 w-full border border-[#d9d2c2] p-2 text-sm focus:border-[#6c8f5e] focus:outline-none"
+              value={formData.fechaEstimada}
+              onChange={handleChange}
+              required
+            />
+          </div>
+          <div>
+            <label className="text-xs font-semibold text-[#5f625c]">Rango Días</label>
+            <input
+              type="text"
+              name="diasEntrega"
+              className="mt-1 w-full border border-[#d9d2c2] p-2 text-sm focus:border-[#6c8f5e] focus:outline-none"
+              value={formData.diasEntrega}
+              onChange={handleChange}
+              required
+            />
+          </div>
+        </div>
+        <div>
+          <label className="text-xs font-semibold text-[#5f625c]">Dirección</label>
+          <input
+            type="text"
+            name="direccion"
+            className="mt-1 w-full border border-[#d9d2c2] p-2 text-sm focus:border-[#6c8f5e] focus:outline-none"
+            value={formData.direccion}
+            onChange={handleChange}
+            required
+          />
+        </div>
+        <button
+          type="submit"
+          disabled={isLoading}
+          className="mt-2 flex h-10 items-center justify-center bg-[#25D366] px-4 text-sm font-semibold text-white transition hover:bg-[#20b858] disabled:opacity-50"
+        >
+          {isLoading ? "Enviando..." : "Enviar Plantilla"}
+        </button>
+
+        {result && (
+          <p
+            className={`mt-2 text-xs font-medium p-2 border ${
+              result.type === "success"
+                ? "border-[#c6efce] bg-[#e2f9e6] text-[#00b050]"
+                : "border-[#f5c6cb] bg-[#f8d7da] text-[#721c24]"
+            }`}
+          >
+            {result.text}
+          </p>
+        )}
+      </form>
+    </div>
+  );
+}
+
 function ChatConversationsPanel() {
   const [chats, setChats] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -450,12 +606,44 @@ function ChatModal({ phone, onClose }: { phone: string; onClose: () => void }) {
   const [isLoading, setIsLoading] = useState(true);
   const [replyText, setReplyText] = useState("");
   const [isSending, setIsSending] = useState(false);
+  const [aiEnabled, setAiEnabled] = useState(false);
+  const [isTogglingAi, setIsTogglingAi] = useState(false);
 
   useEffect(() => {
     loadMessages();
+    loadAiState();
     const interval = setInterval(loadMessages, 5000); // Polling every 5s
     return () => clearInterval(interval);
   }, [phone]);
+
+  async function loadAiState() {
+    try {
+      const res = await fetch(`/api/whatsapp/ai-toggle?phone=${phone}`);
+      const data = await res.json();
+      if (res.ok) setAiEnabled(data.ai_enabled);
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  async function toggleAi() {
+    setIsTogglingAi(true);
+    const newState = !aiEnabled;
+    try {
+      const res = await fetch("/api/whatsapp/ai-toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone, ai_enabled: newState }),
+      });
+      if (res.ok) {
+        setAiEnabled(newState);
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsTogglingAi(false);
+    }
+  }
 
   async function loadMessages() {
     try {
@@ -498,8 +686,25 @@ function ChatModal({ phone, onClose }: { phone: string; onClose: () => void }) {
       <div className="flex h-[600px] w-full max-w-lg flex-col bg-[#ece5dd] shadow-lg">
         {/* Header */}
         <div className="flex items-center justify-between bg-[#075e54] p-4 text-white">
-          <div>
+          <div className="flex items-center gap-4">
             <p className="font-semibold">{phone}</p>
+            <div className="flex items-center gap-2 border-l border-white/30 pl-4">
+              <span className="text-xs font-medium">Agente IA</span>
+              <button
+                type="button"
+                onClick={toggleAi}
+                disabled={isTogglingAi}
+                className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                  aiEnabled ? "bg-[#25d366]" : "bg-[#8f928b]"
+                } disabled:opacity-50`}
+              >
+                <span
+                  className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
+                    aiEnabled ? "translate-x-5" : "translate-x-1"
+                  }`}
+                />
+              </button>
+            </div>
           </div>
           <button onClick={onClose} className="text-xl leading-none">&times;</button>
         </div>

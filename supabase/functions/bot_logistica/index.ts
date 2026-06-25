@@ -825,45 +825,7 @@ async function updateExcelOrder(orderId: string, newStatus: string) {
   });
 }
 
-async function updateExcelObservation(orderIds: string[], text: string) {
-  const token = await getGraphToken();
-  const headers = { "Authorization": `Bearer ${token}` };
-  const file = await findTargetFile(headers);
-  const fileRes = await fetch(file["@microsoft.graph.downloadUrl"]);
-  const arrayBuffer = await fileRes.arrayBuffer();
-  const workbook = new ExcelJS.Workbook();
-  await workbook.xlsx.load(Buffer.from(arrayBuffer));
-  const sheet = workbook.getWorksheet(AZURE_CONFIG.sheetName);
-  
-  let obsCol = 0;
-  sheet.getRow(1).eachCell((cell: any, colNumber: number) => {
-    const val = String(cell.value || "").toUpperCase();
-    if (val.includes('OBSERVACION') || val.includes('OBSERVACIONES')) {
-      obsCol = colNumber;
-    }
-  });
-  
-  if (obsCol === 0) {
-    obsCol = sheet.columnCount + 1;
-    sheet.getRow(1).getCell(obsCol).value = 'Observaciones';
-  }
 
-  sheet.eachRow((row: any, rowNumber: number) => {
-    if (rowNumber === 1) return;
-    const currentOv = String(row.getCell(1).value || "");
-    if (orderIds.includes(currentOv)) {
-      const currentVal = row.getCell(obsCol).value || "";
-      row.getCell(obsCol).value = currentVal ? `${currentVal} - ${text}` : text;
-    }
-  });
-
-  const outBuffer = await workbook.xlsx.writeBuffer();
-  await fetch(`https://graph.microsoft.com/v1.0/drives/${AZURE_CONFIG.driveId}/items/${file.id}/content`, {
-    method: "PUT",
-    headers: { ...headers, "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
-    body: outBuffer
-  });
-}
 
 async function sendWhatsAppMessage(to: string, text: string) {
   let cleanNumber = to.replace(/\D/g, "");
@@ -893,15 +855,15 @@ async function sendWhatsAppMessage(to: string, text: string) {
 }
 
 async function updateSAPAddress(ovs: string[], newAddress: string) {
-  const loginRes = await fetchSAP(`${SAP_BASE_URL}/Login`, {
+  const loginRes = await fetchSAP(`${SAP_CONFIG.baseUrl}/Login`, {
     method: "POST",
-    body: JSON.stringify({ CompanyDB: SAP_COMPANY_DB, Password: SAP_PASSWORD, UserName: SAP_USERNAME })
+    body: JSON.stringify({ CompanyDB: SAP_CONFIG.companyDb, Password: SAP_CONFIG.password, UserName: SAP_CONFIG.userName })
   });
   const cookie = loginRes.headers.get("set-cookie") || "";
 
   for (const ov of ovs) {
     try {
-      const res = await fetchSAP(`${SAP_BASE_URL}/Orders?$filter=DocNum eq ${ov}&$select=DocEntry`, {
+      const res = await fetchSAP(`${SAP_CONFIG.baseUrl}/Orders?$filter=DocNum eq ${ov}&$select=DocEntry`, {
         headers: { "Cookie": cookie }
       });
       if (!res.ok) continue;
@@ -909,7 +871,7 @@ async function updateSAPAddress(ovs: string[], newAddress: string) {
       if (!data.value || data.value.length === 0) continue;
       const docEntry = data.value[0].DocEntry;
 
-      const patchRes = await fetchSAP(`${SAP_BASE_URL}/Orders(${docEntry})`, {
+      const patchRes = await fetchSAP(`${SAP_CONFIG.baseUrl}/Orders(${docEntry})`, {
         method: "PATCH",
         headers: { "Cookie": cookie, "Content-Type": "application/json" },
         body: JSON.stringify({

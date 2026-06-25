@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import type { User } from "@supabase/supabase-js";
@@ -37,6 +37,15 @@ export function DashboardShell() {
   const [ordersMeta, setOrdersMeta] = useState<AgendamientoMeta>({});
   const [ordersError, setOrdersError] = useState("");
   const [isLoadingOrders, setIsLoadingOrders] = useState(false);
+  const [orderStatuses, setOrderStatuses] = useState<Record<string, string>>({});
+  
+  // Hora de corte states
+  const [corteTimes, setCorteTimes] = useState<string[]>([]);
+  const [isCorteModalOpen, setIsCorteModalOpen] = useState(false);
+  const [newCorteTime, setNewCorteTime] = useState("");
+  const [isBulkSending, setIsBulkSending] = useState(false);
+  const lastExecutedMinute = useRef<string>("");
+  const [initiatingOvs, setInitiatingOvs] = useState<Record<string, boolean>>({});
 
   const [availableDates, setAvailableDates] = useState<string[]>([]);
   const [selectedDate, setSelectedDate] = useState<string>("");
@@ -53,6 +62,50 @@ export function DashboardShell() {
       loadAvailableDates();
     });
   }, [router]);
+
+  // Load/Save Corte Times
+  useEffect(() => {
+    const saved = localStorage.getItem("corteTimes");
+    if (saved) setCorteTimes(JSON.parse(saved));
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("corteTimes", JSON.stringify(corteTimes));
+  }, [corteTimes]);
+
+  // Bulk send logic
+  async function executeBulkSend() {
+    if (isBulkSending) return;
+    setIsBulkSending(true);
+    
+    // Todas las ordenes (verdes y amarillas) que no tengan un estado asignado (Sin contactar)
+    const uncontactedOrders = orders.filter(o => !orderStatuses[o.ov]);
+    
+    for (const order of uncontactedOrders) {
+      await handleInitiateChat(order);
+      // Pequeña pausa para no saturar
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    
+    setIsBulkSending(false);
+  }
+
+  // Interval for Corte
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const now = new Date();
+      const currentHour = now.getHours().toString().padStart(2, '0');
+      const currentMinute = now.getMinutes().toString().padStart(2, '0');
+      const currentTime = `${currentHour}:${currentMinute}`;
+
+      if (corteTimes.includes(currentTime) && lastExecutedMinute.current !== currentTime) {
+        lastExecutedMinute.current = currentTime;
+        executeBulkSend();
+      }
+    }, 10000); // Check every 10 seconds
+
+    return () => clearInterval(interval);
+  }, [corteTimes, orders, orderStatuses, isBulkSending]);
 
   async function loadAvailableDates() {
     try {
@@ -104,12 +157,71 @@ export function DashboardShell() {
         skippedZeroRows: data.skippedZeroRows,
         summary: data.summary,
       });
+      await loadStatuses();
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "No se pudieron cargar las ordenes.";
       setOrdersError(message);
     } finally {
       setIsLoadingOrders(false);
+    }
+  }
+
+  async function loadStatuses() {
+    try {
+      const res = await fetch("/api/orders/status");
+      if (res.ok) {
+        const data = await res.json();
+        if (data.statuses) {
+          const statuses = data.statuses.reduce((acc: any, curr: any) => {
+            acc[curr.ov] = curr.estado;
+            return acc;
+          }, {});
+          setOrderStatuses(statuses);
+        }
+      }
+    } catch (error) {
+      console.error("Error loading statuses:", error);
+    }
+  }
+
+  async function handleInitiateChat(order: AgendamientoOrder) {
+    setInitiatingOvs((prev) => ({ ...prev, [order.ov]: true }));
+    
+    const parts = order.nombreCliente.split(" - ");
+    const name = parts.length > 1 ? parts.slice(1).join(" - ") : order.nombreCliente;
+    const prov = order.clienteFinal !== "N/A" ? order.clienteFinal : (parts[0] || "Distribuidor");
+    
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const dateStr = tomorrow.toLocaleDateString('es-CO');
+
+    try {
+      const res = await fetch("/api/whatsapp/initiate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          to: order.telefono,
+          ov: order.ov,
+          nombre: name,
+          proveedor: prov,
+          producto: order.descCant,
+          fechaEstimada: dateStr,
+          diasEntrega: "2 a 3 días hábiles",
+          direccion: order.direccion
+        })
+      });
+      if (res.ok) {
+        setOrderStatuses((prev) => ({ ...prev, [order.ov]: "Primer contacto enviado" }));
+      } else {
+        const data = await res.json();
+        alert(`Error: ${data.error}`);
+      }
+    } catch (error) {
+      console.error(error);
+      alert("Error al iniciar la charla.");
+    } finally {
+      setInitiatingOvs((prev) => ({ ...prev, [order.ov]: false }));
     }
   }
 
@@ -147,6 +259,17 @@ export function DashboardShell() {
           </div>
 
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+            <button
+              onClick={() => setIsCorteModalOpen(true)}
+              className="px-4 py-1.5 border border-[#6c8f5e] text-[#6c8f5e] rounded hover:bg-[#6c8f5e]/10 font-medium text-sm transition-colors relative"
+            >
+              Hora de Corte
+              {corteTimes.length > 0 && (
+                <span className="absolute -top-2 -right-2 bg-red-500 text-white text-xs rounded-full h-5 w-5 flex items-center justify-center">
+                  {corteTimes.length}
+                </span>
+              )}
+            </button>
             <p className="break-all text-sm text-[#5f625c]">{user?.email}</p>
             <Link
               href="/dashboard/chats"
@@ -279,6 +402,19 @@ export function DashboardShell() {
                           <strong className="text-[#20231f] font-medium">Artículos:</strong> {order.descCant}
                         </p>
                       </div>
+                      <div className="mt-4 sm:mt-0 shrink-0 flex flex-col items-end gap-2">
+                        <span className={`text-xs font-semibold px-2 py-1 rounded-full ${orderStatuses[order.ov] === 'Primer contacto enviado' ? 'bg-[#e2f9e6] text-[#00b050]' : 'bg-[#f0f0f0] text-[#5f625c]'}`}>
+                          {orderStatuses[order.ov] || "Sin contactar"}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleInitiateChat(order)}
+                          disabled={initiatingOvs[order.ov]}
+                          className="flex h-9 items-center justify-center border border-[#6c8f5e] bg-white px-4 text-sm font-semibold text-[#6c8f5e] transition hover:bg-[#6c8f5e] hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          {initiatingOvs[order.ov] ? "Enviando..." : "Iniciar Charla"}
+                        </button>
+                      </div>
                     </div>
                   </article>
                 ))}
@@ -287,29 +423,81 @@ export function DashboardShell() {
           </section>
 
           <aside className="space-y-6">
-            <div className="border border-[#d9d2c2] bg-white p-6 shadow-sm">
-              <p className="text-sm font-medium uppercase text-[#6c8f5e]">
-                Conexion
-              </p>
-              <h2 className="mt-2 text-xl font-semibold">Supabase REST</h2>
-              <p className="mt-4 break-all font-mono text-sm text-[#3e423b]">
-                {supabaseRestUrl}
-              </p>
-              {ordersMeta.matchedRows !== undefined ? (
-                <div className="mt-6 space-y-2 border-t border-[#ece6d8] pt-5 text-sm text-[#5f625c]">
-                  <p>Filas verdes/amarillas: {ordersMeta.matchedRows}</p>
-                  <p>Filas descartadas en cero: {ordersMeta.skippedZeroRows ?? 0}</p>
-                  <p>Hoja: {ordersMeta.sheet}</p>
-                </div>
-              ) : null}
-            </div>
-
+            <TestOrderPanel orders={orders} />
             <WhatsAppTestPanel />
             <TemplateTestPanel />
             <ChatConversationsPanel />
           </aside>
         </div>
       </section>
+
+      {/* Modal Hora de Corte */}
+      {isCorteModalOpen && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-[#fcfbf9] p-6 rounded-lg shadow-xl border border-[#d1d5db] w-96 max-w-full">
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-xl font-semibold text-[#1a1a1a]">Configurar Hora de Corte</h2>
+              <button onClick={() => setIsCorteModalOpen(false)} className="text-gray-500 hover:text-black">✖</button>
+            </div>
+            <p className="text-sm text-gray-600 mb-4">
+              Añade horas en las que el bot automáticamente enviará el primer contacto a las órdenes "Sin contactar".
+            </p>
+            
+            <div className="flex gap-2 mb-4">
+              <input 
+                type="time" 
+                value={newCorteTime} 
+                onChange={(e) => setNewCorteTime(e.target.value)}
+                className="flex-1 px-3 py-2 border border-[#d1d5db] rounded"
+              />
+              <button 
+                onClick={() => {
+                  if (newCorteTime && !corteTimes.includes(newCorteTime)) {
+                    setCorteTimes([...corteTimes, newCorteTime]);
+                    setNewCorteTime("");
+                  }
+                }}
+                className="px-4 py-2 bg-[#6c8f5e] text-white rounded font-medium hover:bg-[#56754b]"
+              >
+                Agregar
+              </button>
+            </div>
+
+            <ul className="space-y-2 mb-4 max-h-40 overflow-y-auto">
+              {corteTimes.length === 0 ? (
+                <li className="text-sm text-gray-500 italic">No hay horas programadas.</li>
+              ) : (
+                corteTimes.map(time => (
+                  <li key={time} className="flex justify-between items-center bg-white border p-2 rounded">
+                    <span className="font-medium text-lg">{time}</span>
+                    <button 
+                      onClick={() => setCorteTimes(corteTimes.filter(t => t !== time))}
+                      className="text-red-500 hover:text-red-700 text-sm font-medium"
+                    >
+                      Eliminar
+                    </button>
+                  </li>
+                ))
+              )}
+            </ul>
+
+            {isBulkSending && (
+              <div className="bg-yellow-100 text-yellow-800 p-2 rounded text-sm mb-4 font-medium text-center animate-pulse">
+                ⏳ Ejecutando envío masivo ahora mismo...
+              </div>
+            )}
+
+            <div className="flex justify-end">
+              <button 
+                onClick={() => setIsCorteModalOpen(false)}
+                className="px-4 py-2 bg-gray-200 text-gray-800 rounded font-medium hover:bg-gray-300"
+              >
+                Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
@@ -378,6 +566,113 @@ function WhatsAppTestPanel() {
           className="mt-2 flex h-10 items-center justify-center bg-[#25D366] px-4 text-sm font-semibold text-white transition hover:bg-[#20b858] disabled:opacity-50"
         >
           {isLoading ? "Enviando..." : "Enviar por WP"}
+        </button>
+
+        {result && (
+          <p
+            className={`mt-2 text-xs font-medium p-2 border ${
+              result.type === "success"
+                ? "border-[#c6efce] bg-[#e2f9e6] text-[#00b050]"
+                : "border-[#f5c6cb] bg-[#f8d7da] text-[#721c24]"
+            }`}
+          >
+            {result.text}
+          </p>
+        )}
+      </form>
+    </div>
+  );
+}
+
+function TestOrderPanel({ orders }: { orders: AgendamientoOrder[] }) {
+  const [testPhone, setTestPhone] = useState("");
+  const [testOv, setTestOv] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [result, setResult] = useState<{ type: "success" | "error"; text: string } | null>(null);
+
+  async function handleTestSend(e: React.FormEvent) {
+    e.preventDefault();
+    if (!testPhone || !testOv) return;
+    setIsLoading(true);
+    setResult(null);
+
+    const orderData = orders.find(o => String(o.ov) === String(testOv));
+    if (!orderData) {
+      setResult({ type: "error", text: "No se encontró la OV en la lista actual de órdenes." });
+      setIsLoading(false);
+      return;
+    }
+
+    const parts = orderData.nombreCliente.split(" - ");
+    const name = parts.length > 1 ? parts.slice(1).join(" - ") : orderData.nombreCliente;
+    const prov = orderData.clienteFinal !== "N/A" ? orderData.clienteFinal : (parts[0] || "Distribuidor");
+    
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const dateStr = tomorrow.toLocaleDateString('es-CO');
+
+    try {
+      const res = await fetch("/api/whatsapp/initiate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          to: testPhone, // Se envía al número simulado
+          ov: orderData.ov,
+          nombre: name,
+          proveedor: prov,
+          producto: orderData.descCant,
+          fechaEstimada: dateStr,
+          diasEntrega: "2 a 3 días hábiles",
+          direccion: orderData.direccion
+        })
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || "Error al enviar mensaje de prueba");
+      }
+      setResult({ type: "success", text: "¡Simulación iniciada correctamente!" });
+    } catch (err: any) {
+      setResult({ type: "error", text: err.message });
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  return (
+    <div className="border border-[#d9d2c2] bg-white p-6 shadow-sm">
+      <p className="text-sm font-medium uppercase text-[#6c8f5e]">
+        Prueba con Orden de Fabricación
+      </p>
+      <form onSubmit={handleTestSend} className="mt-4 flex flex-col gap-3">
+        <div>
+          <label className="text-xs font-semibold text-[#5f625c]">Número celular (Simulado)</label>
+          <input
+            type="text"
+            placeholder="Ej: 3001234567"
+            className="mt-1 w-full border border-[#d9d2c2] p-2 text-sm focus:border-[#6c8f5e] focus:outline-none"
+            value={testPhone}
+            onChange={(e) => setTestPhone(e.target.value)}
+            required
+          />
+        </div>
+        <div>
+          <label className="text-xs font-semibold text-[#5f625c]">Número de Orden (OV)</label>
+          <input
+            type="text"
+            placeholder="Ej: 146590"
+            className="mt-1 w-full border border-[#d9d2c2] p-2 text-sm focus:border-[#6c8f5e] focus:outline-none"
+            value={testOv}
+            onChange={(e) => setTestOv(e.target.value)}
+            required
+          />
+        </div>
+        <button
+          type="submit"
+          disabled={isLoading}
+          className="mt-2 flex h-10 items-center justify-center bg-[#25D366] px-4 text-sm font-semibold text-white transition hover:bg-[#20b858] disabled:opacity-50"
+        >
+          {isLoading ? "Enviando..." : "Simular Charla"}
         </button>
 
         {result && (

@@ -16,6 +16,7 @@ export function ChatsEnvironment() {
   const [selectedPhone, setSelectedPhone] = useState<string | null>(null);
 
   useEffect(() => {
+    let interval: NodeJS.Timeout;
     supabase.auth.getSession().then(({ data }) => {
       if (!data.session) {
         router.replace("/");
@@ -23,7 +24,11 @@ export function ChatsEnvironment() {
       }
       setUser(data.session.user);
       loadChats();
+      interval = setInterval(loadChats, 5000);
     });
+    return () => {
+      if (interval) clearInterval(interval);
+    };
   }, [router]);
 
   async function loadChats() {
@@ -98,7 +103,7 @@ export function ChatsEnvironment() {
               <button onClick={loadChats} className="text-xs text-[#5f625c] hover:underline">Refrescar</button>
             </div>
             <div className="flex-1 overflow-y-auto p-2">
-              {isLoadingChats ? (
+              {isLoadingChats && chats.length === 0 ? (
                 <p className="p-4 text-center text-sm text-[#5f625c]">Cargando chats...</p>
               ) : chats.length === 0 ? (
                 <p className="p-4 text-center text-sm text-[#5f625c]">No hay conversaciones aún.</p>

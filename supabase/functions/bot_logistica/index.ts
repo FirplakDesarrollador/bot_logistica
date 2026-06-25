@@ -150,15 +150,28 @@ Deno.serve(async (req: Request) => {
 
       if (message) {
         const from = message.from;
-        const text = message.text?.body?.toLowerCase();
+        
+        let originalText = message.text?.body;
+        if (!originalText) {
+           if (message.type === 'audio') originalText = "🎙️ [Mensaje de audio]";
+           else if (message.type === 'image') originalText = "📷 [Imagen]";
+           else if (message.type === 'location') originalText = "📍 [Ubicación]";
+           else if (message.type === 'button') originalText = message.button?.text;
+           else if (message.type === 'interactive') {
+             originalText = message.interactive?.button_reply?.title || message.interactive?.list_reply?.title;
+           }
+           else originalText = `[Mensaje no soportado: ${message.type || 'desconocido'}]`;
+        }
+        
+        const text = originalText?.toLowerCase() || "";
 
         // Guardar mensaje entrante en la BD
-        if (text && from) {
+        if (originalText && from) {
           const { error: dbError } = await supabase.from("whatsapp_messages").insert([
             {
               phone_number: from,
               direction: "inbound",
-              message_body: text,
+              message_body: originalText,
               status: "received",
             },
           ]);
@@ -229,8 +242,20 @@ Deno.serve(async (req: Request) => {
             }
           }
 
+          let systemPrompt = `Eres de servicio al cliente de logística en FIRPLAK S.A. Actúa como un humano, sé EXTREMADAMENTE breve y al grano. Saluda muy corto. NO des explicaciones largas ni ofrezcas ayuda repetitiva.
+Tu objetivo AHORA MISMO es validar si el cliente confirma o rechaza los datos de despacho que se le enviaron recientemente.
+- REGLA 1: Si el cliente confirma que los datos están bien, respóndele agradeciendo e infórmale que pronto le notificaremos cuando el pedido vaya en camino. OBLIGATORIAMENTE incluye al final de tu respuesta EXACTAMENTE esto: [ESTADO: CONFIRMADO].
+- REGLA 2: Si el cliente indica que NO PUEDE RECIBIR en la fecha planteada y te DA UNA NUEVA FECHA (exacta o aproximada), agradécele e indícale que has registrado la nueva fecha. OBLIGATORIAMENTE incluye al final: [ESTADO: NUEVA_FECHA, VALOR: <la nueva fecha que dio el cliente>].
+- REGLA 3: Si el cliente indica que la DIRECCIÓN ESTÁ MAL y te DA LA NUEVA DIRECCIÓN, agradécele e indícale que has actualizado la dirección en el sistema. OBLIGATORIAMENTE incluye al final: [ESTADO: NUEVA_DIRECCION, VALOR: <la nueva dirección que dio el cliente>].
+- REGLA 4: Si el cliente dice que algo está mal (dirección, fecha, nombre) pero NO te da el dato nuevo, pregúntale: "¿Me podrías indicar cuál es el dato correcto para actualizarlo?". OBLIGATORIAMENTE incluye al final: [ESTADO: RECHAZADO].
+- Si el cliente hace una pregunta general, respóndele normalmente.`;
+
+          if (extraContext) {
+            systemPrompt += `\n\nDatos de las OVs consultadas:\n${extraContext}`;
+          }
+
           const groqMessages = [
-            { role: "system", content: "Eres de servicio al cliente de logística en FIRPLAK S.A. Actúa como un humano, sé EXTREMADAMENTE breve y al grano. Saluda muy corto, por ejemplo: '¡Hola! ¿Cómo estás? ¿En qué te puedo ayudar hoy?'. NO des explicaciones largas. NO ofrezcas ayuda repetitiva. Si preguntan por una OV, da solo el estado, fecha y artículos sin adornos." + (extraContext ? `\n\nDatos de las OVs consultadas:\n${extraContext}` : "") }
+            { role: "system", content: systemPrompt }
           ];
 
           if (recentMsgs) {
@@ -259,7 +284,56 @@ Deno.serve(async (req: Request) => {
 
             if (aiRes.ok) {
               const aiData = await aiRes.json();
-              const reply = aiData.choices[0].message.content;
+              let reply = aiData.choices[0].message.content;
+              
+              // Detect Intent and Update State
+              let newState = "";
+              let excelObs = "";
+              let newAddress = "";
+              
+              const matchFecha = reply.match(/\[ESTADO:\s*NUEVA_FECHA,\s*VALOR:\s*(.+?)\]/i);
+              const matchDir = reply.match(/\[ESTADO:\s*NUEVA_DIRECCION,\s*VALOR:\s*(.+?)\]/i);
+
+              if (reply.includes("[ESTADO: CONFIRMADO]")) {
+                newState = "Datos confirmados";
+                excelObs = "Direccion confirmada";
+                reply = reply.replace(/\[ESTADO:\s*CONFIRMADO\]/ig, "").trim();
+              } else if (matchFecha) {
+                newState = "Cambio de fecha solicitado";
+                excelObs = "Nueva fecha a recibir: " + matchFecha[1].trim();
+                reply = reply.replace(matchFecha[0], "").trim();
+              } else if (matchDir) {
+                newState = "Dirección actualizada";
+                newAddress = matchDir[1].trim();
+                excelObs = "Nueva direccion: " + newAddress;
+                reply = reply.replace(matchDir[0], "").trim();
+              } else if (reply.includes("[ESTADO: RECHAZADO]")) {
+                newState = "Datos incorrectos - Validando";
+                reply = reply.replace(/\[ESTADO:\s*RECHAZADO\]/ig, "").trim();
+              }
+
+              if (newState) {
+                const possiblePhone2 = from.startsWith("57") ? from.substring(2) : from;
+                const { error: updErr, data: updatedOrders } = await supabase
+                  .from("ordenes_agendamiento")
+                  .update({ estado: newState })
+                  .in("telefono", [from, possiblePhone2])
+                  .in("estado", ["Primer contacto enviado", "Datos incorrectos - Validando"])
+                  .select("ov");
+                
+                if (updErr) {
+                  console.error("Error updating intent state:", updErr);
+                } else if (updatedOrders && updatedOrders.length > 0) {
+                  const ovs = updatedOrders.map(o => String(o.ov));
+                  if (excelObs) {
+                    updateExcelObservation(ovs, excelObs).catch(e => console.error("Error updating Excel:", e));
+                  }
+                  if (newAddress) {
+                    updateSAPAddress(ovs, newAddress).catch(e => console.error("Error updating SAP:", e));
+                  }
+                }
+              }
+
               await sendWhatsAppMessage(from, reply);
               return new Response("OK", { status: 200 }); // Termina aquí si la IA respondió
             } else {
@@ -751,6 +825,46 @@ async function updateExcelOrder(orderId: string, newStatus: string) {
   });
 }
 
+async function updateExcelObservation(orderIds: string[], text: string) {
+  const token = await getGraphToken();
+  const headers = { "Authorization": `Bearer ${token}` };
+  const file = await findTargetFile(headers);
+  const fileRes = await fetch(file["@microsoft.graph.downloadUrl"]);
+  const arrayBuffer = await fileRes.arrayBuffer();
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(Buffer.from(arrayBuffer));
+  const sheet = workbook.getWorksheet(AZURE_CONFIG.sheetName);
+  
+  let obsCol = 0;
+  sheet.getRow(1).eachCell((cell: any, colNumber: number) => {
+    const val = String(cell.value || "").toUpperCase();
+    if (val.includes('OBSERVACION') || val.includes('OBSERVACIONES')) {
+      obsCol = colNumber;
+    }
+  });
+  
+  if (obsCol === 0) {
+    obsCol = sheet.columnCount + 1;
+    sheet.getRow(1).getCell(obsCol).value = 'Observaciones';
+  }
+
+  sheet.eachRow((row: any, rowNumber: number) => {
+    if (rowNumber === 1) return;
+    const currentOv = String(row.getCell(1).value || "");
+    if (orderIds.includes(currentOv)) {
+      const currentVal = row.getCell(obsCol).value || "";
+      row.getCell(obsCol).value = currentVal ? `${currentVal} - ${text}` : text;
+    }
+  });
+
+  const outBuffer = await workbook.xlsx.writeBuffer();
+  await fetch(`https://graph.microsoft.com/v1.0/drives/${AZURE_CONFIG.driveId}/items/${file.id}/content`, {
+    method: "PUT",
+    headers: { ...headers, "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
+    body: outBuffer
+  });
+}
+
 async function sendWhatsAppMessage(to: string, text: string) {
   let cleanNumber = to.replace(/\D/g, "");
   if (cleanNumber.length === 10) {
@@ -775,5 +889,109 @@ async function sendWhatsAppMessage(to: string, text: string) {
   } else {
     const errorText = await res.text();
     console.error("Error enviando mensaje de WP:", errorText);
+  }
+}
+
+async function updateSAPAddress(ovs: string[], newAddress: string) {
+  const loginRes = await fetchSAP(`${SAP_BASE_URL}/Login`, {
+    method: "POST",
+    body: JSON.stringify({ CompanyDB: SAP_COMPANY_DB, Password: SAP_PASSWORD, UserName: SAP_USERNAME })
+  });
+  const cookie = loginRes.headers.get("set-cookie") || "";
+
+  for (const ov of ovs) {
+    try {
+      const res = await fetchSAP(`${SAP_BASE_URL}/Orders?$filter=DocNum eq ${ov}&$select=DocEntry`, {
+        headers: { "Cookie": cookie }
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (!data.value || data.value.length === 0) continue;
+      const docEntry = data.value[0].DocEntry;
+
+      const patchRes = await fetchSAP(`${SAP_BASE_URL}/Orders(${docEntry})`, {
+        method: "PATCH",
+        headers: { "Cookie": cookie, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          AddressExtension: {
+            ShipToStreet: newAddress
+          }
+        })
+      });
+      if (!patchRes.ok) {
+         console.error(`Error patching SAP OV ${ov}:`, await patchRes.text());
+      }
+    } catch (e) {
+      console.error(`Error in SAP address update for OV ${ov}:`, e);
+    }
+  }
+}
+
+function getExcelColumnLetter(colIndex: number): string {
+  let letter = "";
+  let temp = colIndex;
+  while (temp >= 0) {
+    letter = String.fromCharCode(65 + (temp % 26)) + letter;
+    temp = Math.floor(temp / 26) - 1;
+  }
+  return letter;
+}
+
+async function updateExcelObservation(ovs: string[], observation: string) {
+  try {
+    const token = await getGraphToken();
+    const headers = { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" };
+    
+    // Buscar el archivo del día (reutilizando la función que hace fallback a search)
+    const file = await findTargetFile(headers);
+    if (!file) {
+      console.error("No se pudo encontrar el archivo Excel para actualizar observaciones.");
+      return;
+    }
+
+    // Extraer el rango de datos usados
+    const rangeRes = await fetch(`https://graph.microsoft.com/v1.0/drives/${AZURE_CONFIG.driveId}/items/${file.id}/workbook/worksheets('${AZURE_CONFIG.sheetName}')/usedRange`, { headers });
+    if (!rangeRes.ok) throw new Error("Error getting usedRange: " + await rangeRes.text());
+    
+    const rangeData = await rangeRes.json();
+    if (!rangeData || !rangeData.values || rangeData.values.length === 0) return;
+
+    // Buscar los índices de las columnas
+    const headersRow = rangeData.values[0];
+    const ovColIndex = headersRow.findIndex((h: string) => h === "DOCUMENTO" || h === "OV" || String(h).toUpperCase().includes("OV"));
+    const obsColIndex = headersRow.findIndex((h: string) => typeof h === 'string' && h.toUpperCase().includes("OBSERVACI"));
+
+    if (ovColIndex === -1 || obsColIndex === -1) {
+      console.error(`Columnas no encontradas. OV col: ${ovColIndex}, Obs col: ${obsColIndex}`);
+      return;
+    }
+
+    const colLetter = getExcelColumnLetter(obsColIndex);
+
+    // Iterar y actualizar cada OV solicitada
+    for (const ov of ovs) {
+      const rowIndex = rangeData.values.findIndex((row: any[]) => String(row[ovColIndex]) === String(ov));
+      if (rowIndex > -1) {
+        const cellAddress = `${colLetter}${rowIndex + 1}`;
+        console.log(`Updating OV ${ov} at ${cellAddress} con observación: '${observation}'`);
+        
+        // Parchar la celda específica vía Graph API
+        const patchRes = await fetch(`https://graph.microsoft.com/v1.0/drives/${AZURE_CONFIG.driveId}/items/${file.id}/workbook/worksheets('${AZURE_CONFIG.sheetName}')/range(address='${cellAddress}')`, {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ values: [[observation]] })
+        });
+        
+        if (!patchRes.ok) {
+          console.error(`Failed to patch cell ${cellAddress} for OV ${ov}:`, await patchRes.text());
+        } else {
+          console.log(`Excel actualizado correctamente para OV ${ov}`);
+        }
+      } else {
+        console.log(`OV ${ov} no encontrada en el Excel.`);
+      }
+    }
+  } catch (err) {
+    console.error("Error en updateExcelObservation:", err);
   }
 }

@@ -296,7 +296,7 @@ Tu objetivo AHORA MISMO es validar si el cliente confirma o rechaza los datos de
 
               if (reply.includes("[ESTADO: CONFIRMADO]")) {
                 newState = "Datos confirmados";
-                excelObs = "Direccion confirmada";
+                excelObs = "listo para despacho";
                 reply = reply.replace(/\[ESTADO:\s*CONFIRMADO\]/ig, "").trim();
               } else if (matchFecha) {
                 newState = "Cambio de fecha solicitado";
